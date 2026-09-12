@@ -13,6 +13,7 @@ import csv
 import sys
 from decimal import Decimal
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -22,13 +23,21 @@ from engine.rank import best_candidate
 from ingestion.loader import DATASET_DIR, Dataset, Request, load_dataset, load_env
 from output.explanation import render
 from output.contract import COLUMNS, Decision
-from state.reconstruct import build_state
+from facts.store import FactStore
+from state.reconstruct import build_state, overrides_from_facts
 
 
-def solve(req: Request, ds: Dataset) -> Decision:
-    """Produce one decision for one request. Pure and deterministic."""
+def solve(req: Request, ds: Dataset, facts: Optional[FactStore] = None) -> Decision:
+    """Produce one decision for one request. Pure and deterministic.
+
+    `facts` carries the cached message/image extractions. Absent it, the solver
+    runs on the structured dataset alone - no network access in the hot path.
+    """
     prof = ds.profile_for(req)
-    state = build_state(req, ds)
+    facts = facts if facts is not None else FactStore.empty()
+    state = build_state(req, ds,
+                        overrides=overrides_from_facts(facts.messages_for(req.user_id)),
+                        image_amounts=facts.image_amounts())
     forecast = build_forecast(state)
     amount_safe = amount_safe_today(forecast, req.requested_amount)
     earliest = earliest_full_payment(forecast, req.requested_amount)
@@ -64,7 +73,8 @@ def run(requests_file: str = "requests.csv") -> tuple[Dataset, list[Decision]]:
     """Load the dataset and solve every request in it."""
     load_env()
     ds = load_dataset(requests_file=requests_file)
-    return ds, [solve(req, ds) for req in ds.requests]
+    facts = FactStore.load().index_by_user(ds)
+    return ds, [solve(req, ds, facts) for req in ds.requests]
 
 
 def write_output(decisions: list[Decision], out_path: Path) -> None:

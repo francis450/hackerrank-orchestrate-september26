@@ -11,7 +11,7 @@ Cash-state rules (AGENTS.md 6.3, refined by D001):
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Callable, Optional
@@ -45,12 +45,51 @@ class CashFlow:
 
 @dataclass
 class MessageOverride:
-    """Phase 3 hook: a fact extracted from messages/images that amends an event."""
-    event_id: str
-    action: str  # cancel | amend_amount | delay | confirm
+    """A fact extracted from messages/images that amends the event stream.
+
+    Produced by facts.message_parser via overrides_from_facts(). Every field is
+    an enum, a number or a date - untrusted free text never reaches here.
+    """
+    action: str  # cancel | amend_amount | income_level | income_end
+    event_id: str = ""
     amount: Optional[Decimal] = None
     new_date: Optional[date] = None
     source: str = ""
+
+
+#: Message kinds that amend a specific event.
+_EVENT_ACTIONS = {"payment_cancelled": "cancel", "amount_amended": "amend_amount"}
+#: Message kinds that reshape the income projection.
+_INCOME_ACTIONS = {"income_increase": "income_level", "income_decrease": "income_level",
+                   "income_ended": "income_end"}
+
+
+def overrides_from_facts(facts) -> list[MessageOverride]:
+    """Translate typed message facts into event-stream amendments.
+
+    Facts that carry no usable payload are dropped here rather than downstream:
+    an amendment with no amount, or an income change with no effective date,
+    cannot be applied safely, and guessing would invent a financial fact.
+    """
+    out: list[MessageOverride] = []
+    for fact in facts:
+        kind = fact.kind.value if hasattr(fact.kind, "value") else str(fact.kind)
+        if kind in _EVENT_ACTIONS:
+            if not fact.event_id:
+                continue
+            if kind == "amount_amended" and fact.amount is None:
+                continue
+            out.append(MessageOverride(action=_EVENT_ACTIONS[kind], event_id=fact.event_id,
+                                       amount=fact.amount, new_date=fact.effective_date,
+                                       source=fact.message_id))
+        elif kind in _INCOME_ACTIONS:
+            if fact.effective_date is None:
+                continue
+            if kind != "income_ended" and fact.amount is None:
+                continue
+            out.append(MessageOverride(action=_INCOME_ACTIONS[kind], amount=fact.amount,
+                                       new_date=fact.effective_date, source=fact.message_id))
+    return out
 
 
 @dataclass
@@ -109,7 +148,9 @@ def build_state(req: Request, ds: Dataset, aggregation: AggregationRule = "mean"
                 include_request_day: bool = False,
                 min_interval_occurrences: int = MIN_INTERVAL_OCCURRENCES,
                 monthly_rule: Optional[AggregationRule] = None,
-                interval_rule: Optional[AggregationRule] = None) -> UserState:
+                interval_rule: Optional[AggregationRule] = None,
+                overrides: Optional[list[MessageOverride]] = None,
+                image_amounts: Optional[dict[str, Decimal]] = None) -> UserState:
     """Assemble the forecastable cash position for one request.
 
     include_request_day decides whether flows dated on request_date itself land
@@ -123,12 +164,27 @@ def build_state(req: Request, ds: Dataset, aggregation: AggregationRule = "mean"
                       opening_balance=prof.current_available_balance,
                       minimum_balance=prof.minimum_balance_to_keep)
 
-    raw = [e for e in ds.events_by_user.get(req.user_id, []) if _is_cash(e)]
+    overrides = list(overrides or [])
+    image_amounts = image_amounts or {}
+    state.message_overrides = overrides
+    cancelled = {o.event_id for o in overrides if o.action == "cancel"}
+    amended = {o.event_id: o.amount for o in overrides if o.action == "amend_amount"}
+
+    raw = [e for e in ds.events_by_user.get(req.user_id, [])
+           if _is_cash(e) and e.event_id not in cancelled]
     kept, dropped = dedupe(raw)
     if dropped:
         state.notes.append(f"dropped {dropped} duplicate event rows")
 
     def to_home(ev: Event) -> Optional[Decimal]:
+        """Event amount in home currency, after image and message amendments.
+
+        A blank amount is resolved from its linked image, never treated as zero
+        (AGENTS.md 6.1); an explicit amendment wins over the recorded figure.
+        """
+        override = amended.get(ev.event_id, image_amounts.get(ev.event_id))
+        if override is not None:
+            ev = replace(ev, amount=override)
         try:
             return ds.to_home(ev, prof)
         except FxRateUnavailable as exc:
@@ -138,7 +194,8 @@ def build_state(req: Request, ds: Dataset, aggregation: AggregationRule = "mean"
     _add_dated_flows(state, kept, after, end, to_home)
     _add_recurring_expenses(state, kept, req, as_of, after, end, to_home, aggregation,
                             min_interval_occurrences, monthly_rule, interval_rule)
-    _add_income(state, kept, as_of, after, end, to_home, income_aggregation, income_cv_limit)
+    _add_income(state, kept, as_of, after, end, to_home, income_aggregation,
+                income_cv_limit, overrides)
     state.flows.sort(key=lambda f: (f.day, f.source_event_id))
     return state
 
@@ -200,7 +257,7 @@ def _already_committed(committed: set[tuple[str, str, date]], key: tuple[str, st
 
 def _add_income(state: UserState, events: list[Event], as_of: date, after: date, end: date,
                 to_home: Callable[[Event], Optional[Decimal]], rule: AggregationRule,
-                cv_limit: float) -> None:
+                cv_limit: float, overrides: list[MessageOverride]) -> None:
     """Classify income semantically, then project only what is genuinely recurring."""
     income = [e for e in events if e.direction == "credit" and e.event_type == "income"]
     settled = [e for e in income if e.status == "settled"
@@ -211,7 +268,18 @@ def _add_income(state: UserState, events: list[Event], as_of: date, after: date,
     state.notes.append(f"income: {stream.kind} ({stream.note})")
 
     already = {f.day for f in state.flows if f.event_type == "income"}
+    level = sorted((o for o in overrides if o.action == "income_level" and o.new_date),
+                   key=lambda o: o.new_date)
+    ends = min((o.new_date for o in overrides if o.action == "income_end" and o.new_date),
+               default=None)
     for day, amount in stream.project(after, end):
+        # A confirmed pay change applies to every payment on or after its
+        # effective date; an ended stream pays nothing after its last date.
+        if ends is not None and day >= ends:
+            continue
+        for o in level:
+            if day >= o.new_date and o.amount is not None:
+                amount = o.amount
         if day in already or amount <= 0:
             continue
         state.flows.append(CashFlow(day=day, amount=amount, category="salary",
