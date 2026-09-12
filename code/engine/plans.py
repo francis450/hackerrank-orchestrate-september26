@@ -16,6 +16,7 @@ from decimal import Decimal
 from typing import Optional
 
 from engine.forecast import Forecast, amount_safe_today, earliest_full_payment, plan_is_safe
+from engine.spending_changes import find_spending_changes
 from ingestion.records import PaymentOption, Profile, Request
 from output.contract import Payment
 
@@ -102,17 +103,23 @@ def installment_months(opt: PaymentOption) -> Decimal:
     return Decimal(opt.number_of_payments) * freq / DAYS_PER_MONTH
 
 
-def _full_payment(req: Request, prof: Profile, fc: Forecast, earliest: Optional[date],
+def _full_payment(req: Request, ds, prof: Profile, fc: Forecast, earliest: Optional[date],
                   rejected: list[Rejection]) -> Optional[Candidate]:
     if not prof.accepts("full_payment"):
         rejected.append(Rejection("full_payment", "method_not_accepted"))
         return None
     payments = [Payment(day=req.request_date, amount=req.requested_amount)]
-    if not plan_is_safe(fc, payments):
+    if plan_is_safe(fc, payments):
+        return Candidate(method="full_payment", status="affordable_now",
+                         payments=payments, earliest_full=earliest)
+    # Eligible but unsafe: permitted spending changes may still close the gap.
+    found = find_spending_changes(req, ds, fc, prof)
+    if found is None:
         rejected.append(Rejection("full_payment", "unsafe_on_request_date"))
         return None
-    return Candidate(method="full_payment", status="affordable_now",
-                     payments=payments, earliest_full=earliest)
+    tokens, _ = found
+    return Candidate(method="full_payment", status="affordable_with_plan",
+                     payments=payments, spending_changes=tokens, earliest_full=earliest)
 
 
 def _wait(req: Request, prof: Profile, fc: Forecast, earliest: Optional[date],
@@ -219,7 +226,7 @@ def build_candidates(req: Request, ds, fc: Forecast, prof: Profile) -> Candidate
     rejected: list[Rejection] = []
 
     candidates: list[Candidate] = []
-    for maybe in (_full_payment(req, prof, fc, earliest, rejected),
+    for maybe in (_full_payment(req, ds, prof, fc, earliest, rejected),
                   _wait(req, prof, fc, earliest, rejected),
                   _partial_payment(req, prof, fc, safe, earliest, rejected)):
         if maybe is not None:

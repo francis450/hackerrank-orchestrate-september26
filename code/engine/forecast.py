@@ -38,6 +38,9 @@ class Forecast:
     minimum_balance: Decimal
     credits: list[Decimal] = field(default_factory=list)
     intraday_debits_first: bool = True
+    #: The state this forecast was projected from, so spending changes can be
+    #: applied to the underlying flows and the forecast rebuilt.
+    state: Optional[UserState] = None
 
     def __post_init__(self) -> None:
         if not self.credits:
@@ -101,7 +104,7 @@ def build_forecast(state: UserState, horizon_days: int = HORIZON_DAYS,
             credits[idx] += flow.amount
     return Forecast(start=state.as_of, balances=balances, credits=credits,
                     minimum_balance=state.minimum_balance,
-                    intraday_debits_first=intraday_debits_first)
+                    intraday_debits_first=intraday_debits_first, state=state)
 
 
 def amount_safe_today(fc: Forecast, requested_amount: Decimal) -> Decimal:
