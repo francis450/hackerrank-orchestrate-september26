@@ -18,8 +18,9 @@ from typing import Callable, Optional
 
 from ingestion.loader import Dataset, FxRateUnavailable
 from ingestion.records import Event, Profile, Request
-from state.recurrence import (INCOME_CV_LIMIT, AggregationRule, Cadence, IncomeStream,
-                              RecurringExpense, classify_income, detect_expense_recurrence)
+from state.recurrence import (INCOME_CV_LIMIT, MIN_INTERVAL_OCCURRENCES, AggregationRule,
+                              Cadence, IncomeStream, RecurringExpense, classify_income,
+                              detect_expense_recurrence)
 
 DEAD_STATUSES = frozenset({"failed", "cancelled"})
 NON_CASH_TYPES = frozenset({"investment_valuation"})
@@ -103,10 +104,21 @@ def dedupe(events: list[Event]) -> tuple[list[Event], int]:
 
 
 def build_state(req: Request, ds: Dataset, aggregation: AggregationRule = "mean",
-                horizon_days: int = 90, income_cv_limit: float = INCOME_CV_LIMIT) -> UserState:
-    """Assemble the forecastable cash position for one request."""
+                horizon_days: int = 90, income_cv_limit: float = INCOME_CV_LIMIT,
+                income_aggregation: AggregationRule = "last",
+                include_request_day: bool = False,
+                min_interval_occurrences: int = MIN_INTERVAL_OCCURRENCES,
+                monthly_rule: Optional[AggregationRule] = None,
+                interval_rule: Optional[AggregationRule] = None) -> UserState:
+    """Assemble the forecastable cash position for one request.
+
+    include_request_day decides whether flows dated on request_date itself land
+    inside the window. It is expressed as an exclusive lower bound one day
+    earlier, so every projector shares the same boundary.
+    """
     prof: Profile = ds.profile_for(req)
     as_of, end = req.request_date, req.request_date + timedelta(days=horizon_days)
+    after = as_of - timedelta(days=1) if include_request_day else as_of
     state = UserState(user_id=req.user_id, as_of=as_of, currency=prof.home_currency,
                       opening_balance=prof.current_available_balance,
                       minimum_balance=prof.minimum_balance_to_keep)
@@ -123,19 +135,20 @@ def build_state(req: Request, ds: Dataset, aggregation: AggregationRule = "mean"
             state.notes.append(f"fx unavailable for {ev.event_id}: {exc}")
             return None
 
-    _add_dated_flows(state, kept, as_of, end, to_home)
-    _add_recurring_expenses(state, kept, req, as_of, end, to_home, aggregation)
-    _add_income(state, kept, as_of, end, to_home, aggregation, income_cv_limit)
+    _add_dated_flows(state, kept, after, end, to_home)
+    _add_recurring_expenses(state, kept, req, as_of, after, end, to_home, aggregation,
+                            min_interval_occurrences, monthly_rule, interval_rule)
+    _add_income(state, kept, as_of, after, end, to_home, income_aggregation, income_cv_limit)
     state.flows.sort(key=lambda f: (f.day, f.source_event_id))
     return state
 
 
-def _add_dated_flows(state: UserState, events: list[Event], as_of: date, end: date,
+def _add_dated_flows(state: UserState, events: list[Event], after: date, end: date,
                      to_home: Callable[[Event], Optional[Decimal]]) -> None:
     """Explicit rows that move cash inside the forecast window."""
     for ev in events:
         when = ev.settlement_date or ev.event_date
-        if when is None or not (as_of < when <= end) or not _counts_now(ev):
+        if when is None or not (after < when <= end) or not _counts_now(ev):
             continue
         amount = to_home(ev)
         if amount is None:
@@ -147,8 +160,11 @@ def _add_dated_flows(state: UserState, events: list[Event], as_of: date, end: da
 
 
 def _add_recurring_expenses(state: UserState, events: list[Event], req: Request, as_of: date,
-                            end: date, to_home: Callable[[Event], Optional[Decimal]],
-                            rule: AggregationRule) -> None:
+                            after: date, end: date,
+                            to_home: Callable[[Event], Optional[Decimal]],
+                            rule: AggregationRule, min_interval_occurrences: int,
+                            monthly_rule: Optional[AggregationRule],
+                            interval_rule: Optional[AggregationRule]) -> None:
     """Detect recurring debit streams from settled history and project them forward."""
     groups: dict[tuple[str, str], list[Event]] = defaultdict(list)
     for ev in events:
@@ -163,11 +179,12 @@ def _add_recurring_expenses(state: UserState, events: list[Event], req: Request,
         amounts = [a for a in (to_home(e) for e in history) if a is not None]
         if len(amounts) != len(history):
             continue
-        detected = detect_expense_recurrence(history, amounts, rule)
+        detected = detect_expense_recurrence(history, amounts, rule, min_interval_occurrences,
+                                             monthly_rule, interval_rule)
         if detected is None or detected.cadence is Cadence.NONE or detected.amount <= 0:
             continue
         state.recurring_expenses.append(detected)
-        for day in detected.project(as_of, end):
+        for day in detected.project(after, end):
             if _already_committed(committed, key, day):
                 continue
             state.flows.append(CashFlow(day=day, amount=-detected.amount, category=key[1],
@@ -181,7 +198,7 @@ def _already_committed(committed: set[tuple[str, str, date]], key: tuple[str, st
                for offset in range(-DEDUPE_WINDOW_DAYS, DEDUPE_WINDOW_DAYS + 1))
 
 
-def _add_income(state: UserState, events: list[Event], as_of: date, end: date,
+def _add_income(state: UserState, events: list[Event], as_of: date, after: date, end: date,
                 to_home: Callable[[Event], Optional[Decimal]], rule: AggregationRule,
                 cv_limit: float) -> None:
     """Classify income semantically, then project only what is genuinely recurring."""
@@ -194,7 +211,7 @@ def _add_income(state: UserState, events: list[Event], as_of: date, end: date,
     state.notes.append(f"income: {stream.kind} ({stream.note})")
 
     already = {f.day for f in state.flows if f.event_type == "income"}
-    for day, amount in stream.project(as_of, end):
+    for day, amount in stream.project(after, end):
         if day in already or amount <= 0:
             continue
         state.flows.append(CashFlow(day=day, amount=amount, category="salary",

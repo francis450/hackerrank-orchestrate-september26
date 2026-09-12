@@ -18,6 +18,7 @@ from ingestion.records import Event
 AggregationRule = Literal["mean", "median", "last", "p75"]
 
 MIN_OCCURRENCES = 2
+MIN_INTERVAL_OCCURRENCES = 2
 MONTHLY_GAP_LO, MONTHLY_GAP_HI = 27, 32
 MAX_DISTINCT_DOM = 2
 INCOME_CV_LIMIT = 0.25  # D005: 0.05 rejected genuine salary step-changes; see log.txt
@@ -128,12 +129,23 @@ def _median_gap(days: Sequence[date]) -> Optional[float]:
 
 
 def detect_expense_recurrence(events: Sequence[Event], amounts: Sequence[Decimal],
-                              rule: AggregationRule) -> Optional[RecurringExpense]:
+                              rule: AggregationRule,
+                              min_interval_occurrences: int = MIN_INTERVAL_OCCURRENCES,
+                              monthly_rule: Optional[AggregationRule] = None,
+                              interval_rule: Optional[AggregationRule] = None,
+                              ) -> Optional[RecurringExpense]:
     """Classify one (event_type, category) group of settled debits.
 
     Monthly when the day-of-month is stable (at most two distinct values) and the
     median gap looks like a month; otherwise a fixed interval stepped from the last
-    occurrence. Fewer than MIN_OCCURRENCES rows is not evidence of recurrence.
+    occurrence. Fewer than MIN_OCCURRENCES rows is not evidence of recurrence, and
+    an irregular interval stream can be held to a higher bar via
+    min_interval_occurrences.
+
+    Cadence is decided before the amount, so monthly_rule and interval_rule can
+    aggregate the two kinds differently - a fixed monthly bill is best described
+    by its latest value, while variable spending may warrant a conservative
+    upper quantile.
     """
     if len(events) < MIN_OCCURRENCES:
         return None
@@ -145,14 +157,17 @@ def detect_expense_recurrence(events: Sequence[Event], amounts: Sequence[Decimal
     if gap is None:
         return None
     doms = {d.day for d in days}
-    amount = aggregate(amounts, rule)
     common = dict(event_type=events[0].event_type, category=events[0].category,
-                  amount=amount, last_seen=days[-1],
+                  last_seen=days[-1],
                   source_event_ids=tuple(e.event_id for e in events))
     if len(doms) <= MAX_DISTINCT_DOM and MONTHLY_GAP_LO <= gap <= MONTHLY_GAP_HI:
-        return RecurringExpense(cadence=Cadence.MONTHLY, day_of_month=days[-1].day, **common)
+        return RecurringExpense(cadence=Cadence.MONTHLY, day_of_month=days[-1].day,
+                                amount=aggregate(amounts, monthly_rule or rule), **common)
+    if len(events) < min_interval_occurrences:
+        return None
     step = max(1, int(round(gap)))
-    return RecurringExpense(cadence=Cadence.INTERVAL, step_days=step, **common)
+    return RecurringExpense(cadence=Cadence.INTERVAL, step_days=step,
+                            amount=aggregate(amounts, interval_rule or rule), **common)
 
 
 def is_one_off_income(description: str) -> bool:
