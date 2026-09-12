@@ -20,7 +20,7 @@ AggregationRule = Literal["mean", "median", "last", "p75"]
 MIN_OCCURRENCES = 2
 MONTHLY_GAP_LO, MONTHLY_GAP_HI = 27, 32
 MAX_DISTINCT_DOM = 2
-INCOME_CV_LIMIT = 0.05
+INCOME_CV_LIMIT = 0.25  # D005: 0.05 rejected genuine salary step-changes; see log.txt
 
 #: A settled income row whose description matches any of these is a one-off:
 #: it describes money that arrived once and must never be projected forward.
