@@ -49,8 +49,10 @@ def validate_decision(dec: Decision, req: Request, ds: Optional[Dataset] = None)
         bad.append("payment_plan contains a non-positive amount")
     if any(p.day < req.request_date for p in plan):
         bad.append("payment_plan contains a date before request_date")
-    if plan and plan[-1].day > req.desired_completion_date:
-        bad.append("payment_plan finishes after desired_completion_date")
+    # D8: a plan finishing after desired_completion_date is NOT a violation.
+    # The spec makes completion by the deadline ranking key 1, not a hard gate;
+    # golden request_11 pays on 2025-05-03 with earliest 2025-07-15 against a
+    # 2025-06-12 deadline.
 
     bad += _validate_changes(dec, req, ds)
     bad += _validate_dates(dec, req)
@@ -70,8 +72,9 @@ def _validate_dates(dec: Decision, req: Request) -> list[str]:
             bad.append("earliest_date_for_full_payment beyond the 90-day horizon")
     if dec.affordability_status == "affordable_now" and earliest != req.request_date:
         bad.append("affordable_now requires earliest_date_for_full_payment == request_date")
-    if (earliest is None) != (dec.affordability_status == "not_affordable"):
-        bad.append("empty earliest_date_for_full_payment must coincide with not_affordable")
+    # D7: earliest_date_for_full_payment is a capacity measure, emitted from the
+    # forecast even when nothing is recommended, so it is empty only when no safe
+    # full payment exists in the horizon - not whenever the row is not_affordable.
     return bad
 
 
@@ -82,8 +85,8 @@ def _validate_coupling(dec: Decision, req: Request, plan: Sequence[Payment],
     if (status == "not_affordable") != (method == "not_recommended"):
         bad.append("not_affordable and not_recommended must coincide")
     if method == "not_recommended":
-        if plan or dec.earliest_date_for_full_payment or dec.spending_changes_needed:
-            bad.append("not_recommended requires plan=none, empty earliest, changes=none")
+        if plan or dec.spending_changes_needed:
+            bad.append("not_recommended requires plan=none and changes=none")
     elif method == "full_payment":
         if len(plan) != 1 or plan[0].day != req.request_date or plan[0].amount != req.requested_amount:
             bad.append("full_payment requires one payment of requested_amount on request_date")

@@ -20,7 +20,7 @@ from engine.forecast import amount_safe_today, build_forecast, earliest_full_pay
 from engine.plans import build_candidates
 from engine.rank import best_candidate
 from ingestion.loader import DATASET_DIR, Dataset, Request, load_dataset, load_env
-from output.explanation import not_recommended_incomplete, not_recommended_no_option
+from output.explanation import render
 from output.contract import COLUMNS, Decision
 from state.reconstruct import build_state
 
@@ -37,29 +37,25 @@ def solve(req: Request, ds: Dataset) -> Decision:
     winner = best_candidate(candidates, req)
 
     if winner is None:
-        explanation = (not_recommended_incomplete(req, prof, amount_safe)
-                       if amount_safe > Decimal(0)
-                       else not_recommended_no_option(req, prof))
-        return Decision(
-            request_id=req.request_id,
-            amount_safe_to_pay=amount_safe,
-            affordability_status="not_affordable",
-            recommended_payment_method="not_recommended",
-            payment_plan=[],
-            earliest_date_for_full_payment=None,
-            spending_changes_needed=[],
-            decision_explanation=explanation,
-        )
+        status, method = "not_affordable", "not_recommended"
+        payments, changes = [], []
+    else:
+        status, method = winner.status, winner.method
+        payments, changes = list(winner.payments), list(winner.spending_changes)
 
+    # amount_safe_to_pay and earliest_date_for_full_payment measure financial
+    # capacity, which the spec defines independently of the recommendation, so
+    # both come from the forecast even when nothing is recommended.
     return Decision(
         request_id=req.request_id,
         amount_safe_to_pay=amount_safe,
-        affordability_status=winner.status,
-        recommended_payment_method=winner.method,
-        payment_plan=list(winner.payments),
-        earliest_date_for_full_payment=winner.earliest_full,
-        spending_changes_needed=list(winner.spending_changes),
-        decision_explanation="",
+        affordability_status=status,
+        recommended_payment_method=method,
+        payment_plan=payments,
+        earliest_date_for_full_payment=earliest,
+        spending_changes_needed=changes,
+        decision_explanation=render(req, prof, ds, status, method, payments,
+                                    changes, earliest, amount_safe),
     )
 
 

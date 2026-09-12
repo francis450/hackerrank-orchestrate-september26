@@ -1,4 +1,4 @@
-"""The spec's 6-key ranking sort over safe candidate plans.
+"""The spec's six-key ranking sort over safe candidate plans.
 
 Ordering (problem_statement.md, "Choosing Between Safe Plans"):
   1. completes the full request by desired_completion_date
@@ -7,6 +7,9 @@ Ordering (problem_statement.md, "Choosing Between Safe Plans"):
   4. starts payment earlier
   5. uses fewer payments
   6. lowest payment_option_id
+
+Key 1 is a penalty, never a disqualifier: a plan that overruns the deadline
+still ranks, it just ranks behind every plan that does not.
 """
 from __future__ import annotations
 
@@ -15,20 +18,23 @@ from decimal import Decimal
 from typing import Optional, Sequence
 
 from engine.plans import Candidate
-from ingestion.loader import Request
-
-_FAR_FUTURE = date(9999, 12, 31)
+from ingestion.records import Request
 
 
 def sort_key(cand: Candidate, req: Request) -> tuple:
-    """Total order implementing the six tie-breakers. Lower sorts better."""
+    """Total order implementing the six tie-breakers. Lower sorts better.
+
+    option_id falls back to the empty string, so a plan carrying no option
+    (full_payment, wait, partial_payment) wins a tie against an installment
+    option rather than losing to it.
+    """
     return (
-        0 if cand.completes_by(req.desired_completion_date) else 1,
-        1 if cand.spending_changes else 0,
+        not cand.completes_by(req.desired_completion_date),
+        bool(cand.spending_changes),
         cand.total_paid,
-        cand.payments[0].day if cand.payments else _FAR_FUTURE,
+        cand.payments[0].day,
         len(cand.payments),
-        cand.option_id or "￿",
+        cand.option_id or "",
     )
 
 
