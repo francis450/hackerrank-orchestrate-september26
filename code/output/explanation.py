@@ -62,11 +62,12 @@ def change_phrases(changes: Sequence[str], ds, currency: str) -> str:
 
 def render(req: Request, prof: Profile, ds, status: str, method: str,
            payments: Sequence[Payment], changes: Sequence[str],
-           earliest: Optional[date], amount_safe: Decimal) -> str:
+           earliest: Optional[date], amount_safe: Decimal,
+           partial_blocked: bool = False) -> str:
     """Select and fill the template for this decision."""
     cur = prof.home_currency
     if method == "not_recommended":
-        return _not_recommended(req, prof, earliest, amount_safe)
+        return _not_recommended(req, prof, amount_safe, partial_blocked)
     if method == "full_payment":
         if changes:
             return (f"{change_phrases(changes, ds, cur)}, then pay "
@@ -88,17 +89,24 @@ def render(req: Request, prof: Profile, ds, status: str, method: str,
     if method == "installments":
         return (f"Use {len(payments)} installments of {money(cur, payments[0].amount)}, "
                 f"starting {long_date(payments[0].day)}. {_leaves_at_least(prof)}")
-    return _not_recommended(req, prof, earliest, amount_safe)
+    return _not_recommended(req, prof, amount_safe, partial_blocked)
 
 
-def _not_recommended(req: Request, prof: Profile, earliest: Optional[date],
-                     amount_safe: Decimal) -> str:
-    """Two variants, keyed on whether the forecast ever makes a full payment safe."""
+def _not_recommended(req: Request, prof: Profile, amount_safe: Decimal,
+                     partial_blocked: bool) -> str:
+    """Two variants, keyed on the mechanism that defeated the request.
+
+    Variant B is reserved for the case where a partial payment was actually
+    constructed - the request allows it, the user accepts it, and a non-trivial
+    amount is safe today - and then failed only because no completion date
+    exists inside the deadline. That is precisely "available today, but cannot
+    be completed". Anything else means no option ever cleared the minimum.
+    """
     cur = prof.home_currency
-    if earliest is None:
-        return (f"Do not make this payment by {long_date(req.desired_completion_date)}. "
-                f"None of the available options keeps the "
-                f"{money(cur, prof.minimum_balance_to_keep)} minimum protected.")
-    return (f"Do not proceed with the {money(cur, req.requested_amount)} request. "
-            f"Although {money(cur, amount_safe)} is available today, the full amount "
-            f"cannot be completed safely within 90 days.")
+    if partial_blocked:
+        return (f"Do not proceed with the {money(cur, req.requested_amount)} request. "
+                f"Although {money(cur, amount_safe)} is available today, the full amount "
+                f"cannot be completed safely within 90 days.")
+    return (f"Do not make this payment by {long_date(req.desired_completion_date)}. "
+            f"None of the available options keeps the "
+            f"{money(cur, prof.minimum_balance_to_keep)} minimum protected.")

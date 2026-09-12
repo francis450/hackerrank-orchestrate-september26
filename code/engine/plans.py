@@ -21,6 +21,39 @@ from output.contract import Payment
 
 DAYS_PER_MONTH = Decimal(30)
 
+#: Rejection codes meaning "this partial plan was fully constructed and would
+#: have been offered, but the completion date defeated it". These are the only
+#: reasons that justify the 'cannot be completed safely' explanation variant.
+PARTIAL_BLOCKED_BY_COMPLETION = frozenset({"earliest_missing", "earliest_after_deadline"})
+
+
+@dataclass(frozen=True)
+class Rejection:
+    """Why one candidate was not offered. Recorded so downstream layers read a
+    fact instead of re-deriving a guess from correlated fields."""
+    method: str
+    reason: str
+    detail: str = ""
+    option_id: str = ""
+
+
+@dataclass
+class CandidateSet:
+    """Everything build_candidates concluded: what survived, and why the rest did not."""
+    candidates: list["Candidate"] = field(default_factory=list)
+    rejected_reasons: list[Rejection] = field(default_factory=list)
+
+    def __iter__(self):
+        return iter(self.candidates)
+
+    def __len__(self) -> int:
+        return len(self.candidates)
+
+    def partial_blocked_by_completion(self) -> bool:
+        """True when a partial plan was constructed and lost only to the deadline."""
+        return any(r.method == "partial_payment" and r.reason in PARTIAL_BLOCKED_BY_COMPLETION
+                   for r in self.rejected_reasons)
+
 
 @dataclass
 class Candidate:
@@ -69,61 +102,104 @@ def installment_months(opt: PaymentOption) -> Decimal:
     return Decimal(opt.number_of_payments) * freq / DAYS_PER_MONTH
 
 
-def _full_payment(req: Request, prof: Profile, fc: Forecast,
-                  earliest: Optional[date]) -> Optional[Candidate]:
+def _full_payment(req: Request, prof: Profile, fc: Forecast, earliest: Optional[date],
+                  rejected: list[Rejection]) -> Optional[Candidate]:
     if not prof.accepts("full_payment"):
+        rejected.append(Rejection("full_payment", "method_not_accepted"))
         return None
     payments = [Payment(day=req.request_date, amount=req.requested_amount)]
     if not plan_is_safe(fc, payments):
+        rejected.append(Rejection("full_payment", "unsafe_on_request_date"))
         return None
     return Candidate(method="full_payment", status="affordable_now",
                      payments=payments, earliest_full=earliest)
 
 
-def _wait(req: Request, prof: Profile, fc: Forecast,
-          earliest: Optional[date]) -> Optional[Candidate]:
+def _wait(req: Request, prof: Profile, fc: Forecast, earliest: Optional[date],
+          rejected: list[Rejection]) -> Optional[Candidate]:
     """Waiting is still a full payment, so it needs full_payment to be acceptable."""
-    if not prof.accepts("full_payment") or earliest is None or earliest <= req.request_date:
+    if not prof.accepts("full_payment"):
+        rejected.append(Rejection("wait", "method_not_accepted"))
+        return None
+    if earliest is None:
+        rejected.append(Rejection("wait", "earliest_missing"))
+        return None
+    if earliest <= req.request_date:
+        rejected.append(Rejection("wait", "already_safe_today"))
         return None
     payments = [Payment(day=earliest, amount=req.requested_amount)]
     if not plan_is_safe(fc, payments):
+        rejected.append(Rejection("wait", "unsafe_plan"))
         return None
     return Candidate(method="wait", status="affordable_later",
                      payments=payments, earliest_full=earliest)
 
 
 def _partial_payment(req: Request, prof: Profile, fc: Forecast, safe: Decimal,
-                     earliest: Optional[date]) -> Optional[Candidate]:
-    if not (req.allows_partial_payment and prof.accepts("partial_payment")):
+                     earliest: Optional[date], rejected: list[Rejection]) -> Optional[Candidate]:
+    """Construction gates first, then the completion gates.
+
+    The order matters to the explanation layer: only a plan that cleared every
+    construction gate and then failed on the completion date counts as "the full
+    amount cannot be completed safely".
+    """
+    if not req.allows_partial_payment:
+        rejected.append(Rejection("partial_payment", "request_disallows_partial"))
+        return None
+    if not prof.accepts("partial_payment"):
+        rejected.append(Rejection("partial_payment", "method_not_accepted"))
         return None
     if not Decimal(0) < safe < req.requested_amount:
+        rejected.append(Rejection("partial_payment", "safe_not_strictly_between",
+                                  f"safe={safe} requested={req.requested_amount}"))
         return None
-    if earliest is None or earliest > req.desired_completion_date:
+    # Constructed: the user would take this plan if a completion date existed.
+    if earliest is None:
+        rejected.append(Rejection("partial_payment", "earliest_missing"))
+        return None
+    if earliest > req.desired_completion_date:
+        rejected.append(Rejection("partial_payment", "earliest_after_deadline",
+                                  f"earliest={earliest} due={req.desired_completion_date}"))
         return None
     remainder = req.requested_amount - safe
     payments = [Payment(day=req.request_date, amount=safe),
                 Payment(day=earliest, amount=remainder)]
     if sum((p.amount for p in payments), Decimal(0)) != req.requested_amount:
+        rejected.append(Rejection("partial_payment", "payments_do_not_sum"))
         return None
     if not plan_is_safe(fc, payments):
+        rejected.append(Rejection("partial_payment", "unsafe_plan"))
         return None
     return Candidate(method="partial_payment", status="affordable_with_plan",
                      payments=payments, earliest_full=earliest)
 
 
 def _installments(req: Request, prof: Profile, fc: Forecast, options: list[PaymentOption],
-                  earliest: Optional[date]) -> list[Candidate]:
-    if not prof.accepts("installments") or prof.max_installment_months is None:
+                  earliest: Optional[date], rejected: list[Rejection]) -> list[Candidate]:
+    offers = [o for o in sorted(options, key=lambda o: o.payment_option_id)
+              if o.payment_method == "installments"]
+    if not prof.accepts("installments"):
+        rejected += [Rejection("installments", "method_not_accepted", option_id=o.payment_option_id)
+                     for o in offers]
+        return []
+    if prof.max_installment_months is None:
+        rejected += [Rejection("installments", "no_installment_ceiling",
+                               option_id=o.payment_option_id) for o in offers]
         return []
     out: list[Candidate] = []
     ceiling = Decimal(prof.max_installment_months)
-    for opt in sorted(options, key=lambda o: o.payment_option_id):
-        if opt.payment_method != "installments":
-            continue
-        if installment_months(opt) > ceiling:
+    for opt in offers:
+        months = installment_months(opt)
+        if months > ceiling:
+            rejected.append(Rejection("installments", "exceeds_max_installment_months",
+                                      f"{months} > {ceiling}", opt.payment_option_id))
             continue
         payments = installment_payments(opt)
-        if not payments or not plan_is_safe(fc, payments):
+        if not payments:
+            rejected.append(Rejection("installments", "empty_schedule", "", opt.payment_option_id))
+            continue
+        if not plan_is_safe(fc, payments):
+            rejected.append(Rejection("installments", "unsafe_plan", "", opt.payment_option_id))
             continue
         out.append(Candidate(method="installments", status="affordable_with_plan",
                              payments=payments, option_id=opt.payment_option_id,
@@ -131,8 +207,8 @@ def _installments(req: Request, prof: Profile, fc: Forecast, options: list[Payme
     return out
 
 
-def build_candidates(req: Request, ds, fc: Forecast, prof: Profile) -> list[Candidate]:
-    """Every eligible and safe plan for this request, unranked.
+def build_candidates(req: Request, ds, fc: Forecast, prof: Profile) -> CandidateSet:
+    """Every eligible and safe plan for this request, unranked, plus why the rest failed.
 
     earliest_full is carried identically on every candidate because the output
     contract defines earliest_date_for_full_payment as a measure of financial
@@ -140,12 +216,14 @@ def build_candidates(req: Request, ds, fc: Forecast, prof: Profile) -> list[Cand
     """
     safe = amount_safe_today(fc, req.requested_amount)
     earliest = earliest_full_payment(fc, req.requested_amount)
+    rejected: list[Rejection] = []
 
     candidates: list[Candidate] = []
-    for maybe in (_full_payment(req, prof, fc, earliest),
-                  _wait(req, prof, fc, earliest),
-                  _partial_payment(req, prof, fc, safe, earliest)):
+    for maybe in (_full_payment(req, prof, fc, earliest, rejected),
+                  _wait(req, prof, fc, earliest, rejected),
+                  _partial_payment(req, prof, fc, safe, earliest, rejected)):
         if maybe is not None:
             candidates.append(maybe)
-    candidates += _installments(req, prof, fc, ds.options_for(req.request_id), earliest)
-    return candidates
+    candidates += _installments(req, prof, fc, ds.options_for(req.request_id),
+                                earliest, rejected)
+    return CandidateSet(candidates=candidates, rejected_reasons=rejected)

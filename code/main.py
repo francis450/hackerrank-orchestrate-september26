@@ -33,8 +33,8 @@ def solve(req: Request, ds: Dataset) -> Decision:
     amount_safe = amount_safe_today(forecast, req.requested_amount)
     earliest = earliest_full_payment(forecast, req.requested_amount)
 
-    candidates = build_candidates(req, ds, forecast, prof)
-    winner = best_candidate(candidates, req)
+    offered = build_candidates(req, ds, forecast, prof)
+    winner = best_candidate(offered.candidates, req)
 
     if winner is None:
         status, method = "not_affordable", "not_recommended"
@@ -55,7 +55,8 @@ def solve(req: Request, ds: Dataset) -> Decision:
         earliest_date_for_full_payment=earliest,
         spending_changes_needed=changes,
         decision_explanation=render(req, prof, ds, status, method, payments,
-                                    changes, earliest, amount_safe),
+                                    changes, earliest, amount_safe,
+                                    partial_blocked=offered.partial_blocked_by_completion()),
     )
 
 
