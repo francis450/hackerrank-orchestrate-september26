@@ -33,7 +33,7 @@ def solve(req: Request, ds: Dataset) -> Decision:
     amount_safe = amount_safe_today(forecast, req.requested_amount)
     earliest = earliest_full_payment(forecast, req.requested_amount)
 
-    candidates = build_candidates(req, ds, forecast, prof, amount_safe, earliest)
+    candidates = build_candidates(req, ds, forecast, prof)
     winner = best_candidate(candidates, req)
 
     if winner is None:
