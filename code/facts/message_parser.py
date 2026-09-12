@@ -6,10 +6,13 @@ step and a second place for injected instructions to be re-expressed.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, Optional
 
 from facts.llm import DEFAULT_MODEL, FactCache, UsageLedger, call_json, get_client
 from facts.schema import MESSAGE_JSON_SCHEMA, MessageFact
+
+MAX_WORKERS = 8
 
 SYSTEM = """You classify one financial message into a fixed schema.
 
@@ -79,17 +82,21 @@ def parse_messages(messages: Iterable, model: str = DEFAULT_MODEL,
     needs_api = any(cache.get("messages", m.message_id) is None for m in messages)
     client = get_client() if needs_api else None
     facts: list[MessageFact] = []
-    try:
-        for msg in messages:
-            fact = parse_message(msg, client, ledger, cache, model)
-            if fact is not None:
-                facts.append(fact)
-            # Checkpoint as we go: a long run that dies at record 200 must not
-            # discard 199 paid-for calls.
-            if len(facts) % 25 == 0:
-                cache.save()
-                ledger.save()
-    finally:
-        cache.save()
-        ledger.save()
+    failures: list[tuple[str, str]] = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(parse_message, msg, client, ledger, cache, model): msg.message_id for msg in messages}
+        try:
+            for done in as_completed(futures):
+                try:
+                    fact = done.result()
+                except Exception as exc:  # noqa: BLE001 - one bad record must not kill the batch
+                    failures.append((futures[done], f"{type(exc).__name__}: {exc}"))
+                    continue
+                if fact is not None:
+                    facts.append(fact)
+        finally:
+            cache.save()
+            ledger.save()
+    if failures:
+        print(f"  {len(failures)} extraction failures: {failures[:3]}")
     return facts

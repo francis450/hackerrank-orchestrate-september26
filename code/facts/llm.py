@@ -19,7 +19,7 @@ CACHE_DIR = Path(__file__).resolve().parents[1] / "facts_cache"
 FACTS_PATH = CACHE_DIR / "facts.json"
 USAGE_PATH = CACHE_DIR / "usage.json"
 PROVIDER = "anthropic"
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-sonnet-5"
 
 #: USD per 1M tokens, for the cost columns of the usage report.
 PRICING: dict[str, tuple[Decimal, Decimal]] = {
@@ -57,6 +57,10 @@ class UsageLedger:
     by_model: dict[str, ModelUsage] = field(default_factory=dict)
 
     def record(self, model: str, usage: Any) -> None:
+        with _lock:
+            self._record(model, usage)
+
+    def _record(self, model: str, usage: Any) -> None:
         entry = self.by_model.setdefault(model, ModelUsage(model=model))
         entry.calls += 1
         entry.input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
@@ -126,20 +130,36 @@ def get_client():
     return anthropic.Anthropic()
 
 
+class ExtractionError(RuntimeError):
+    """The model returned no usable JSON for one record."""
+
+
 def call_json(client, model: str, system: str, content: list[dict],
-              json_schema: dict, ledger: UsageLedger, max_tokens: int = 1024) -> dict:
+              json_schema: dict, ledger: UsageLedger, max_tokens: int = 2048) -> dict:
     """One structured-output request. Returns the parsed JSON object.
 
-    Token usage is recorded before the response is inspected, so a malformed
-    payload still shows up in the cost report.
+    Thinking is disabled: these are single-label extractions constrained by a
+    JSON schema, and on Sonnet 5 adaptive thinking is on by default and can
+    consume the whole token budget, leaving a response with no text block.
+
+    Token usage is recorded before the response is inspected, so a refused or
+    malformed call still appears in the cost report.
     """
     response = client.messages.create(
         model=model,
         max_tokens=max_tokens,
         system=system,
         messages=[{"role": "user", "content": content}],
+        thinking={"type": "disabled"},
         output_config={"format": {"type": "json_schema", "schema": json_schema}},
     )
     ledger.record(model, response.usage)
-    text = "".join(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
+    text = "".join(b.text for b in response.content if b.type == "text").strip()
+    if not text:
+        raise ExtractionError(
+            f"empty response (stop_reason={response.stop_reason}, "
+            f"blocks={[b.type for b in response.content]})")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ExtractionError(f"non-JSON response: {text[:160]!r}") from exc

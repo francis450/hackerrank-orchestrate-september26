@@ -20,6 +20,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from facts.store import FactStore
 from ingestion.loader import DATASET_DIR, Dataset, Request, load_dataset, load_env
 from main import solve
 from output.contract import COLUMNS, Decision
@@ -110,6 +111,7 @@ def print_field_accuracy(hits: dict[str, int], total: int, similarity: list[floa
 def evaluate(requests_file: str, show_table: bool) -> int:
     load_env()
     ds: Dataset = load_dataset(requests_file=requests_file)
+    facts = FactStore.load().index_by_user(ds)
     golden = load_golden(requests_file)
 
     hits = {f: 0 for f in SCORED_FIELDS}
@@ -125,7 +127,7 @@ def evaluate(requests_file: str, show_table: bool) -> int:
             errors.append((req.request_id, "no golden row"))
             continue
         try:
-            dec: Decision = solve(req, ds)
+            dec: Decision = solve(req, ds, facts)
         except Exception as exc:  # noqa: BLE001 - a crash is a reportable result
             errors.append((req.request_id, f"{type(exc).__name__}: {exc}"))
             continue
