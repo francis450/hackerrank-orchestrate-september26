@@ -1,5 +1,15 @@
 # Buy or Wait? — AI-powered financial decision agent
 
+## Start here
+
+- `decisions.md` — the decision log: every architectural call, the evidence
+  behind it, and the rules I tried and rejected.
+- `code/engine/forecast.py` — the core safety predicate. Paying X on day d
+  shifts every later balance down by X, so both numeric outputs fall out of
+  one suffix-minimum scan.
+- `code/evaluation/` — the harness built before the solver, and the 20-combination
+  parameter grid that disconfirmed my main hypothesis.
+
 For every request in `dataset/requests.csv`, this system decides whether the user
 should pay in full, pay part now, use an installment option, wait, or not proceed —
 and writes `dataset/output.csv` with the eight required columns.
